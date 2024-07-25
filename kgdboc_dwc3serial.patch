@@ -1,0 +1,363 @@
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index 89fc690fdf34..60ffb594edfa 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -27,6 +27,9 @@
+ #include "gadget.h"
+ #include "io.h"
+ 
++//added by jack for adding poll feature
++struct dwc3 *g_dwc = NULL;
++
+ #define DWC3_ALIGN_FRAME(d, n)	(((d)->frame_number + ((d)->interval * (n))) \
+ 					& ~((d)->interval - 1))
+ 
+@@ -4563,6 +4566,9 @@ int dwc3_gadget_init(struct dwc3 *dwc)
+ 	int irq;
+ 	struct device *dev;
+ 
++	//added by jack
++    g_dwc = dwc;
++
+ 	irq = dwc3_gadget_get_irq(dwc);
+ 	if (irq < 0) {
+ 		ret = irq;
+@@ -4746,3 +4752,107 @@ void dwc3_gadget_process_pending_events(struct dwc3 *dwc)
+ 		enable_irq(dwc->irq_gadget);
+ 	}
+ }
++
++static int __dwc3_gadget_ep_queue_poll(struct dwc3_ep *dep, struct dwc3_request *req)
++{
++	struct dwc3	*dwc = dep->dwc;
++	int	ret;
++
++	if (req->request.status == -EINPROGRESS) {
++		ret = -EBUSY;
++		dev_err(dwc->dev, "%s: %p request already in queue",
++					dep->name, req);
++		return ret;
++	}
++
++	req->request.actual	= 0;
++	req->request.status	= -EINPROGRESS;
++	req->direction = dep->direction;
++	req->epnum = dep->number;
++
++	pm_runtime_get(dwc->dev);
++
++	/*
++	 * We only add to our list of requests now and
++	 * start consuming the list once we get XferNotReady
++	 * IRQ.
++	 *
++	 * That way, we avoid doing anything that we don't need
++	 * to do now and defer it until the point we receive a
++	 * particular token from the Host side.
++	 *
++	 * This will also avoid Host cancelling URBs due to too
++	 * many NAKs.
++	 */
++	ret = usb_gadget_map_request(dwc->gadget, &req->request,
++			dep->direction);
++	if (ret)
++		return ret;
++
++	list_add_tail(&req->list, &dep->pending_list);
++	req->status = DWC3_REQUEST_STATUS_QUEUED;
++	ret = __dwc3_gadget_kick_transfer(dep);
++	if (ret && ret != -EBUSY) {
++		dev_dbg(dwc->dev, "%s: failed to kick transfers\n",
++				dep->name);
++	}
++	return ret;
++}
++
++extern int usb_ep_queue_poll(struct usb_ep *ep, struct usb_request *request,
++	gfp_t gfp_flags)
++{
++	struct dwc3_request *req = to_dwc3_request(request);
++	struct dwc3_ep *dep = to_dwc3_ep(ep);
++	struct dwc3 *dwc = dep->dwc;
++
++	int ret;
++
++	if (!dep->endpoint.desc) {
++		dev_dbg(dwc->dev, "trying to queue request %p to disabled %s\n",
++				request, ep->name);
++		return -ESHUTDOWN;
++	}
++
++	WARN(!dep->direction && (request->length % ep->desc->wMaxPacketSize),
++		"trying to queue unaligned request (%d)\n", request->length);
++
++	//disable_irq_nosync(dwc->irq_gadget);
++
++	ret = __dwc3_gadget_ep_queue_poll(dep, req);
++	return ret;
++}
++
++EXPORT_SYMBOL(usb_ep_queue_poll);
++
++#include <linux/clocksource.h>
++#include <linux/nmi.h>
++
++static void usb_touch_watchdogs(void)
++{
++	touch_softlockup_watchdog_sync();
++	clocksource_touch_watchdog();
++	rcu_cpu_stall_reset();
++}
++
++/* Seems stable :) */
++int usb_loop_poll_hw(struct usb_ep *_ept, struct usb_request *usb_req, int is_rx)
++{
++	int ret = 0;
++	while (1)
++	{
++		dwc3_check_event_buf(g_dwc->ev_buf);
++
++		//printk("evt flags: 0x%x count: %d", g_dwc->ev_buf[0].flags, g_dwc->ev_buf[0].count);
++		ret = dwc3_process_event_buf(g_dwc->ev_buf);
++		g_dwc->pending_events = false;
++		//printk("evt flags: 0x%x count: %d", g_dwc->ev_buf[0].flags, g_dwc->ev_buf[0].count);
++		if (usb_req->status == 0)
++			return 0;
++
++		usb_touch_watchdogs();
++	}
++	return ret;
++}
++
++EXPORT_SYMBOL(usb_loop_poll_hw);
+diff --git a/drivers/usb/gadget/function/u_serial.c b/drivers/usb/gadget/function/u_serial.c
+index a92eb6d90976..5b0252d46b42 100644
+--- a/drivers/usb/gadget/function/u_serial.c
++++ b/drivers/usb/gadget/function/u_serial.c
+@@ -851,6 +851,214 @@ static int gs_break_ctl(struct tty_struct *tty, int duration)
+ 	return status;
+ }
+ 
++//added by jack for poll function
++
++extern int usb_loop_poll_hw(struct usb_ep *_ept, struct usb_request *usb_req, int is_rx);
++
++extern int usb_ep_queue_poll(struct usb_ep *ep, struct usb_request *request,
++	gfp_t gfp_flags);
++
++//#define GS_CONSOLE_BUF_SIZE 512
++static char console_buf[GS_CONSOLE_BUF_SIZE]; /* >= max packet size 512 */
++static int console_buf_len = 0, console_buf_read = 0;
++
++static int gs_poll_init(struct tty_driver *driver, int line, char *options)
++{
++	struct gs_port *port;	
++	struct tty_struct *tty;
++	int ret = 0;
++
++	if (!(line >= 0 && line < MAX_U_SERIAL_PORTS))	
++	{
++		ret =  -EINVAL;
++		goto __out;
++	}
++	port = ports[line].port;    
++	if (!port)
++	{
++		ret = -ENODEV;
++		goto __out;
++	}
++
++	tty = port->port.tty;   
++	if (!tty) {
++		/* the kgdb put/get char functions don't need a tty */      
++		printk("%s: no tty, but it's ok\n", __func__);       
++		ret = 0;
++	} 
++	else 
++	{
++		printk("%s: tty opened for port_num %d\n", __func__, line);  
++	}
++
++__out:
++	return ret;
++}
++
++static int gs_poll_pop_buffer(void) 
++{
++	int ret = 0;
++
++	if (console_buf_read >= console_buf_len)
++		return -EAGAIN;
++
++	ret = console_buf[console_buf_read++];
++
++	return ret;
++}
++
++static void gs_poll_read_complete(struct usb_ep *ep, struct usb_request *req)
++{
++	switch (req->status)
++	{
++	case 0:
++		/* get data */
++		console_buf_len = req->actual;
++		console_buf_read = 0;
++		memcpy(console_buf, req->buf, req->actual);
++		console_buf[req->actual] = '\0';
++		pr_vdebug("[%s] len = %d\n", console_buf, console_buf_len);
++		break;
++	default:
++		pr_err("%s: unexpected status error, status=%d\n", __func__, req->status);
++		break;
++	}
++}
++
++static int __gs_poll_get_char(struct gs_port *port, char *ch)
++{
++	struct gserial *gs = port->port_usb;
++	struct usb_ep *ept = gs->out;
++	struct usb_request *usb_req;
++	int rv;
++	int read_ch = -EINVAL;
++
++	int ret = 0;
++
++	BUG_ON(!ept);
++
++	for (;;)
++	{
++		read_ch = gs_poll_pop_buffer();
++		if (read_ch >= 0)
++			break; /* got a character, done */
++
++		/*
++		 * There is nothing in buffer, start the USB endpoint to
++		 * receive something
++		 */
++
++		/* Replace complete function to intercept usb read */
++		usb_req = gs_alloc_req(ept, ept->maxpacket, GFP_ATOMIC);
++		if (!usb_req)
++		{
++			pr_err("%s: OOM for read req\n", __func__);
++			ret = -ENOMEM;
++			goto __out;
++		}
++
++		/* Queue request */
++		usb_req->length = ept->maxpacket;
++		usb_req->complete = gs_poll_read_complete;
++		if ((rv = usb_ep_queue_poll(ept, usb_req, GFP_ATOMIC)))
++		{
++			pr_err("%s: usb_ep_queue err %d\n", __func__, rv);
++			ret = rv;
++			goto __out;
++		}
++
++		pr_vdebug("%s: polling for read\n", __func__);
++
++		while ( usb_loop_poll_hw(ept, usb_req, 1 /*rx*/) );
++		//printk("usbreqSTATUS %d", usb_req->status);
++		gs_free_req(ept, usb_req);
++	}
++	*ch = read_ch;
++
++__out:
++	return 0;
++}
++
++static int gs_poll_get_char(struct tty_driver *driver, int line)
++{
++	struct gs_port *port;
++	char char_to_read = 0;
++	int rc = 0;
++	int ret = 0;
++
++	if (!(line >= 0 && line < MAX_U_SERIAL_PORTS))
++	{
++		ret = -EINVAL;
++		goto __out;
++	}
++
++	if (!(port = ports[line].port))
++	{
++		ret = -ENODEV;
++		goto __out;
++	}
++	rc = __gs_poll_get_char(port, &char_to_read);
++
++__out:
++	return !rc ? char_to_read : rc;
++}
++
++static void gs_poll_write_complete(struct usb_ep *ep, struct usb_request *req) 
++{
++}
++
++static int __gs_poll_put_char(struct gs_port *port, char ch)
++{
++	struct gserial *gs = port->port_usb;
++	struct usb_ep *ept = gs->in;
++	struct usb_request *usb_req;
++	char send_ch = ch;
++	int rv;
++
++	int ret = 0;
++
++	BUG_ON(!ept);
++	usb_req = gs_alloc_req(ept, ept->maxpacket, GFP_ATOMIC);
++	if (!usb_req)
++	{
++		pr_err("%s: OOM for read req\n", __func__);
++		ret = -ENOMEM;
++		goto __out;
++	}
++	usb_req->complete = gs_poll_write_complete;
++	memcpy(usb_req->buf, &send_ch, 1);
++	usb_req->length = 1;
++	if ((rv = usb_ep_queue_poll(ept, usb_req, GFP_ATOMIC)))
++	{
++		pr_err("%s: usb_ep_queue err %d\n", __func__, rv);
++		ret = rv;
++		goto __out;
++	}
++	/* Send and free request */
++	pr_vdebug("%s: polling for write\n", __func__);
++
++	while ( usb_loop_poll_hw(ept, usb_req, 0 /*tx*/) );
++	gs_free_req(ept, usb_req);
++
++__out:
++	return 0;
++}
++
++static void gs_poll_put_char(struct tty_driver *driver, int line, char ch)
++{
++	struct gs_port *port;
++
++	if (!(line >= 0 && line < MAX_U_SERIAL_PORTS))
++		goto __out;
++	if (!(port = ports[line].port))
++		goto __out;
++
++	__gs_poll_put_char(port, ch);
++
++__out:
++	return;
++}
++
+ static const struct tty_operations gs_tty_ops = {
+ 	.open =			gs_open,
+ 	.close =		gs_close,
+@@ -861,6 +1069,11 @@ static const struct tty_operations gs_tty_ops = {
+ 	.chars_in_buffer =	gs_chars_in_buffer,
+ 	.unthrottle =		gs_unthrottle,
+ 	.break_ctl =		gs_break_ctl,
++#ifdef CONFIG_CONSOLE_POLL
++    .poll_init =		gs_poll_init,
++	.poll_get_char =	gs_poll_get_char,
++	.poll_put_char =	gs_poll_put_char,
++#endif
+ };
+ 
+ /*-------------------------------------------------------------------------*/
